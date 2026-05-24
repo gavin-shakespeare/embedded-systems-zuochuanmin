@@ -268,8 +268,10 @@ def serve_local():
     try:
         env = os.environ.copy()
         env.setdefault("NO_MKDOCS_2_WARNING", "1")
+        # Use module invocation to ensure mkdocs runs even when the `mkdocs`
+        # console script is not on PATH (common in some Windows venv setups).
         subprocess.run(
-            ["mkdocs", "serve", "-a", f"{HOST}:{MKDOCS_PORT}", "--open", "--watch-theme"],
+            [sys.executable, "-m", "mkdocs", "serve", "-a", f"{HOST}:{MKDOCS_PORT}", "--open", "--watch-theme"],
             env=env, check=True, cwd=str(REPO_ROOT),
         )
     except KeyboardInterrupt:

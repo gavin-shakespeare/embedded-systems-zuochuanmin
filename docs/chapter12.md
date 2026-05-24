@@ -25,8 +25,12 @@ skinparam mindmapNodeBorderColor                #90CAF9
 *** 分层/模块化设计
 ** 低功耗设计
 *** STM32 低功耗模式
+*** 为什么需要低功耗设计？
+*** STM32F103 低功耗模式概览
+*** Stop 模式进入与退出
 *** 唤醒源配置
-*** 功耗预算计算
+*** 功耗预算计算示例
+*** 低功耗设计最佳实践checklist
 ** 可靠性保障
 *** 看门狗（IWDG/WWDG）
 *** 断言与错误处理
@@ -125,57 +129,386 @@ int main(void)
 
 ### 12.3 低功耗设计
 
-电池供电的农业传感器节点需要极低功耗以延长工作时间。STM32F103 提供三种低功耗模式：
+#### 12.3.1 为什么需要低功耗设计？
 
-**表 12-2** STM32F103 低功耗模式对比
-<!-- tab:ch12-2 STM32F103 低功耗模式对比 -->
+##### 场景：电池供电的农业传感器节点
 
-| 模式 | 内核 | 外设 | RAM | 唤醒源 | 典型电流 |
-|------|:----:|:----:|:---:|--------|:-------:|
-| Sleep | 停止 | 运行 | 保持 | 任意中断 | ~1.5 mA |
-| Stop | 停止 | 停止 | 保持 | EXTI/RTC | ~20 μA |
-| Standby | 停止 | 停止 | 丢失 | WKUP/RTC/NRST | ~2 μA |
+在智慧农业应用中，大量传感器节点部署在田间地头，采集土壤温湿度、光照强度、PH 值等数据。这些节点通常具有以下约束：
 
-#### 12.3.1 Stop 模式实现
+| 约束项 | 典型值 | 影响 |
+|--------|--------|------|
+| 供电方式 | 太阳能+锂电池 / 一次性锂亚电池 | 无法频繁更换电池 |
+| 部署密度 | 每亩 10~50 个节点 | 维护成本极高 |
+| 数据上报周期 | 5 分钟 ~ 1 小时 | 99% 时间处于空闲 |
+| 工作环境 | -20°C ~ 60°C | 电池容量随温度衰减 |
+
+**核心矛盾**：节点 99% 的时间处于空闲等待状态，但传统运行模式（Run Mode）下 MCU 持续消耗数 mA 甚至数十 mA 电流，导致电池数月内耗尽。
+
+**解决思路**：利用 STM32F103 的低功耗模式，在空闲时进入 **Stop 模式**（电流降至 ~10 µA 量级），仅保留必要外设和唤醒源，从而将续航时间从"月"延长至"年"。
+
+---
+
+#### 12.3.2 STM32F103 低功耗模式概览
+
+STM32F103 支持三种主要低功耗模式：
+
+| 模式 | 进入条件 | 唤醒源 | 典型电流 | 寄存器/内存状态 |
+|------|----------|--------|----------|-----------------|
+| **Sleep** | `WFI()` / `WFE()` | 任意中断/事件 | ~1 mA | 全保留，CPU 停止 |
+| **Stop** | `HAL_PWR_EnterSTOPMode()` | 外部中断、RTC 闹钟、IWDG | ~10 µA | 寄存器/内存保留，时钟停止 |
+| **Standby** | `HAL_PWR_EnterSTANDBYMode()` | WKUP 引脚、RTC 闹钟、IWDG、NRST | ~2 µA | 寄存器/内存丢失，仅备份域保留 |
+
+> **农业传感器推荐**：使用 **Stop 模式**。Standby 模式虽然电流更低，但唤醒后系统复位，上下文丢失，不利于周期性采集任务；Sleep 模式功耗仍偏高。
+
+---
+
+#### 12.3.3 Stop 模式进入与退出
+
+##### 3.1 进入 Stop 模式的核心代码
 
 ```c
-/* 进入 Stop 模式，RTC 闹钟唤醒 */
-void EnterStopMode(uint32_t wakeup_sec)
-{
-    /* 配置 RTC 闹钟 */
-    HAL_RTC_SetAlarm_IT(&hrtc, &alarm, RTC_FORMAT_BIN);
+#include "stm32f1xx_hal.h"
 
-    /* 进入 Stop 模式 */
-    HAL_SuspendTick();
+/**
+ * @brief  进入 Stop 模式，使用电压调节器低功耗模式
+ * @param  None
+ * @retval None
+ * @note   唤醒后需重新配置系统时钟为 72MHz
+ */
+void Enter_Stop_Mode(void)
+{
+    /* 1. 确保所有未使用的外设已关闭以降低漏电流 */
+    __HAL_RCC_GPIOA_CLK_DISABLE();  // 根据实际接线保留需唤醒的 GPIO 时钟
+    __HAL_RCC_GPIOB_CLK_DISABLE();
+    __HAL_RCC_GPIOC_CLK_DISABLE();
+    __HAL_RCC_ADC1_CLK_DISABLE();
+    __HAL_RCC_TIM2_CLK_DISABLE();
+    __HAL_RCC_USART1_CLK_DISABLE();
+    /* ... 保留 RTC 和唤醒源相关外设时钟 ... */
+
+    /* 2. 配置电压调节器为低功耗模式（可选，进一步降低功耗） */
+    /* 若要求更快唤醒，可改用 PWR_MAINREGULATOR_ON */
+
+    /* 3. 进入 Stop 模式：使用 WFI 指令，电压调节器低功耗模式 */
     HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
 
-    /* 唤醒后恢复时钟 */
-    SystemClock_Config();
-    HAL_ResumeTick();
+    /* 
+     * 4. 唤醒后的恢复代码（从 WFI 返回后继续执行此处）
+     *    注意：Stop 模式唤醒后，系统时钟自动切换为 HSI 8MHz
+     *    必须手动恢复为 HSE + PLL 的 72MHz 配置
+     */
+    SystemClock_Config_Restore();
 }
 
-/* 典型工作模式：采集 → 发送 → 休眠 */
-while (1) {
-    Sensor_ReadAll();          /* 采集传感器数据 */
-    MQTT_PublishData();        /* 上报数据 */
-    EnterStopMode(300);        /* 休眠 5 分钟 */
+/**
+ * @brief  恢复系统时钟到 72MHz (HSE + PLL)
+ * @note   此函数内容通常与 CubeMX 生成的 SystemClock_Config() 相同
+ */
+void SystemClock_Config_Restore(void)
+{
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+    /* 使能 HSE */
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+    RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+    RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+    RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;  // 8MHz * 9 = 72MHz
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    /* 配置总线分频 */
+    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                                |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+    {
+        Error_Handler();
+    }
 }
 ```
 
-#### 12.3.2 功耗预算计算
+##### 3.2 关键 API 详解
 
-以 3.7V/2000mAh 锂电池供电为例：
+```c
+void HAL_PWR_EnterSTOPMode(uint32_t Regulator, uint8_t STOPEntry);
+```
 
-**表 12-3** 
-<!-- tab:ch12-3  -->
+| 参数 | 可选值 | 说明 |
+|------|--------|------|
+| `Regulator` | `PWR_MAINREGULATOR_ON` | 主电压调节器保持开启，唤醒更快，功耗略高 |
+| | `PWR_LOWPOWERREGULATOR_ON` | 主调节器进入低功耗模式，功耗更低，唤醒延迟稍大 |
+| `STOPEntry` | `PWR_STOPENTRY_WFI` | 使用 Wait-For-Interrupt 进入，任意中断唤醒 |
+| | `PWR_STOPENTRY_WFE` | 使用 Wait-For-Event 进入，事件唤醒 |
 
-| 阶段 | 时间 | 电流 | 能量消耗 |
-|------|:----:|:----:|:-------:|
-| 采集+发送 | 5s | 50 mA | 0.069 mAh |
-| 休眠 | 295s | 20 μA | 0.0016 mAh |
-| **一个周期（5min）** | **300s** | — | **0.071 mAh** |
+> **农业传感器推荐**：使用 `PWR_LOWPOWERREGULATOR_ON + PWR_STOPENTRY_WFI`，兼顾超低功耗与中断响应。
 
-$$寿命 = \frac{2000 \text{ mAh}}{0.071 \times 12} = 2347 \text{ 小时} \approx 98 \text{ 天}$$
+---
+
+#### 12.3.4 唤醒源配置
+
+##### 4.1 RTC 闹钟唤醒（周期性采集场景）
+
+适用于"每 10 分钟采集一次数据"的定时唤醒需求。
+
+```c
+#include "stm32f1xx_hal.h"
+
+RTC_HandleTypeDef hrtc;
+
+/**
+ * @brief  RTC 初始化（使用外部 32.768kHz 晶振 LSE）
+ */
+void RTC_Init_With_WakeUp(void)
+{
+    /* 使能 PWR 和 BKP 时钟，访问备份域 */
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_RCC_BKP_CLK_ENABLE();
+    HAL_PWR_EnableBkUpAccess();
+
+    /* RTC 初始化结构体 */
+    hrtc.Instance = RTC;
+    hrtc.Init.AsynchPrediv = RTC_AUTO_1_SECOND;  // 默认 1 秒分频
+    if (HAL_RTC_Init(&hrtc) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    /* 配置 RTC 闹钟：10 分钟后唤醒 */
+    RTC_AlarmTypeDef sAlarm = {0};
+    RTC_TimeTypeDef sTime = {0};
+
+    /* 获取当前时间 */
+    HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
+
+    /* 设置闹钟时间：当前秒数 + 600 秒（10 分钟），需处理进位 */
+    uint32_t alarm_seconds = (sTime.Seconds + 600) % 60;
+    uint32_t alarm_minutes = (sTime.Minutes + (sTime.Seconds + 600) / 60) % 60;
+    uint32_t alarm_hours   = (sTime.Hours + (sTime.Minutes + (sTime.Seconds + 600) / 60) / 60) % 24;
+
+    sAlarm.AlarmTime.Hours = alarm_hours;
+    sAlarm.AlarmTime.Minutes = alarm_minutes;
+    sAlarm.AlarmTime.Seconds = alarm_seconds;
+
+    if (HAL_RTC_SetAlarm_IT(&hrtc, &sAlarm, RTC_FORMAT_BIN) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    /* 使能 RTC 闹钟中断（连接至 EXTI Line 17） */
+    HAL_NVIC_SetPriority(RTC_Alarm_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(RTC_Alarm_IRQn);
+}
+
+/**
+ * @brief  RTC 闹钟中断服务函数
+ */
+void RTC_Alarm_IRQHandler(void)
+{
+    HAL_RTC_AlarmIRQHandler(&hrtc);
+}
+
+/**
+ * @brief  闹钟回调（HAL 库弱定义回调）
+ */
+void HAL_RTC_AlarmAEventCallback(RTC_HandleTypeDef *hrtc)
+{
+    /* 设置全局标志，主循环检测到后执行采集与发送 */
+    g_wakeup_flag = WAKEUP_BY_RTC;
+
+    /* 清除闹钟标志，准备下一次设置 */
+    __HAL_RTC_ALARM_CLEAR_FLAG(hrtc, RTC_FLAG_ALRF);
+}
+```
+
+> **注意**：STM32F103 的 RTC 闹钟固定映射到 **EXTI Line 17**，无需手动配置 EXTI，但需确保 NVIC 中断使能。
+
+##### 4.2 外部中断唤醒（突发事件场景）
+
+适用于"土壤湿度突变需立即上报"或"人工按键触发"场景。
+
+```c
+/**
+ * @brief  配置 PA0 为外部中断唤醒源（下降沿触发，连接土壤湿度报警传感器）
+ */
+void EXTI0_WakeUp_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    /* 使能 GPIOA 时钟（Stop 模式下需根据手册确认是否可关闭） */
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    /* 配置 PA0 为输入上拉 */
+    GPIO_InitStruct.Pin = GPIO_PIN_0;
+    GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;  // 下降沿触发
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    /* 配置 EXTI0 中断 */
+    HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+}
+
+/**
+ * @brief  EXTI0 中断服务函数
+ */
+void EXTI0_IRQHandler(void)
+{
+    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_0);
+}
+
+/**
+ * @brief  EXTI 回调函数
+ */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == GPIO_PIN_0)
+    {
+        g_wakeup_flag = WAKEUP_BY_EXTI;
+    }
+}
+```
+
+##### 4.3 主循环中的低功耗调度逻辑
+
+```c
+typedef enum {
+    WAKEUP_NONE = 0,
+    WAKEUP_BY_RTC,
+    WAKEUP_BY_EXTI
+} WakeUp_Source_t;
+
+volatile WakeUp_Source_t g_wakeup_flag = WAKEUP_NONE;
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();  /* 初始 72MHz */
+
+    /* 初始化外设 */
+    RTC_Init_With_WakeUp();
+    EXTI0_WakeUp_Init();
+    Sensor_Init();
+    LoRa_Init();  /* 或其他无线模块 */
+
+    while (1)
+    {
+        if (g_wakeup_flag == WAKEUP_BY_RTC)
+        {
+            g_wakeup_flag = WAKEUP_NONE;
+
+            /* 采集数据 */
+            Sensor_Data_t data = Sensor_Read();
+
+            /* 快速发送 */
+            LoRa_Send(&data);
+
+            /* 重新设置下一次 RTC 闹钟 */
+            RTC_Set_Next_Alarm(600);  /* 10 分钟后 */
+        }
+        else if (g_wakeup_flag == WAKEUP_BY_EXTI)
+        {
+            g_wakeup_flag = WAKEUP_NONE;
+
+            /* 紧急事件处理 */
+            Sensor_Data_t data = Sensor_Read();
+            data.is_urgent = 1;
+            LoRa_Send(&data);
+
+            /* 保持原有 RTC 闹钟计划，无需重置 */
+        }
+
+        /* 任务完成后进入 Stop 模式 */
+        Enter_Stop_Mode();
+
+        /* 唤醒后从这里继续执行，根据 g_wakeup_flag 判断唤醒源 */
+    }
+}
+```
+
+
+#### 12.3.5 功耗预算计算示例
+
+##### 5.1 系统功耗模型
+
+农业传感器节点的总功耗由三部分组成：
+
+`E_total = E_active + E_sleep + E_peripheral_leakage`
+
+##### 5.2 典型参数假设
+
+| 参数 | 数值 | 说明 |
+|------|------|------|
+| 供电电压 | 3.3 V | 锂电池经 LDO 稳压 |
+| 电池容量 | 2000 mAh | 18650 锂电池 |
+| 系统时钟（工作） | 72 MHz | HSE + PLL |
+| 采集+发送周期 | 每 10 分钟一次 | RTC 定时唤醒 |
+| 单次工作时间 | 2 秒 | 传感器预热 + ADC + 无线发送 |
+| 工作电流 | 30 mA | MCU + 传感器 + LoRa 模块 |
+| Stop 模式电流 | 12 µA | MCU + RTC + LSE |
+| 静态漏电流 | 5 µA | 电源指示 LED、LDO 静态电流 |
+
+##### 5.3 计算过程
+
+**Step 1：计算单次工作周期内的平均电流**
+
+一个完整周期 = 10 分钟 = 600 秒
+
+- 工作时间占比：D_active = 2 / 600 = 0.333%
+- 睡眠占比：D_sleep = 99.667%
+
+**Step 2：平均电流计算**
+
+`I_avg = (I_active × D_active) + (I_sleep × D_sleep) + I_leakage`
+
+代入数值：
+
+`I_avg = (30 mA × 0.00333) + (12 µA × 0.99667) + 5 µA`
+
+`I_avg = 100 µA + 11.96 µA + 5 µA ≈ 117 µA`
+
+**Step 3：续航时间计算**
+
+`T_life = 2000 mAh / 0.117 mA ≈ 17,094 小时 ≈ 712 天 ≈ 1.95 年`
+
+##### 5.4 对比分析：如果不使用 Stop 模式
+
+假设空闲时使用 Sleep 模式（~1 mA）或空转（~10 mA）：
+
+| 方案 | 空闲电流 | 平均电流 | 续航时间 |
+|------|----------|----------|----------|
+| **Stop 模式（推荐）** | 12 µA | 117 µA | **~2 年** |
+| Sleep 模式 | 1 mA | ~1.1 mA | **~76 天** |
+| 持续空转 | 10 mA | ~10.1 mA | **~8 天** |
+
+> **结论**：Stop 模式将续航提升 **9~90 倍**，是电池供电农业节点的关键技术。
+
+##### 5.5 进一步优化空间
+
+| 优化手段 | 预期效果 | 实现复杂度 |
+|----------|----------|------------|
+| 降低系统工作频率至 8 MHz | 工作电流降至 ~8 mA | 低 |
+| 使用 LoRa 的 CAD 模式缩短发送前导 | 工作时间从 2s 降至 0.5s | 中 |
+| 关闭 LDO，使用 DC-DC 降压 | 效率从 60% 提升至 90% | 中 |
+| 使用 STM32L 系列替代 F103 | Stop 电流降至 ~1 µA | 高（需换平台）|
+
+---
+
+#### 12.3.6 低功耗设计最佳实践checklist
+
+1. **时钟管理**：进入 Stop 前关闭所有非必要外设时钟（`__HAL_RCC_XXX_CLK_DISABLE()`）
+2. **GPIO 配置**：未使用引脚配置为模拟输入或内部上拉/下拉，避免浮空输入导致漏电流
+3. **唤醒源最小化**：仅保留 RTC 和必要的 EXTI，关闭其他 NVIC 中断
+4. **调试注意**：连接调试器时 Stop 模式可能无法进入或唤醒异常，需断开调试器测试
+5. **电压调节器选择**：若唤醒后需立即高速响应，使用 `PWR_MAINREGULATOR_ON`；若追求极致功耗，使用 `PWR_LOWPOWERREGULATOR_ON`
+6. **备份域保持**：RTC 配置在备份域，首次上电初始化后，后续唤醒无需重复配置（除非完全掉电）
 
 ---
 
